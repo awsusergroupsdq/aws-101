@@ -1,0 +1,191 @@
+name: "03 - Destroy (plantilla de limpieza)"
+
+# CAVEAT IMPORTANTE — leé esto antes de correr el workflow:
+#
+# El state de OpenTofu de los stacks 01-provision-* es local/efímero a
+# propósito (sin backend remoto, ver infra/README.md). Vive solo dentro del
+# job que corrió el "apply" y se pierde en cuanto ese job termina — no queda
+# guardado como artifact ni en ningún otro lado.
+#
+# Eso significa que un `tofu destroy` acá NO SERVIRÍA: en un runner nuevo no
+# hay ningún archivo de state del que partir, así que destruiría "nada" y
+# dejaría los recursos reales huérfanos en la cuenta.
+#
+# Por eso este workflow es una PLANTILLA de limpieza por AWS CLI: busca los
+# recursos por nombre/tag (los mismos hardcodeados en los .tf) y los borra
+# directamente. Verificá siempre en la consola de AWS después de correrlo.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Qué stack limpiar"
+        type: choice
+        options:
+          - ec2
+          - fargate
+        required: true
+      confirm:
+        description: 'Escribí exactamente "destroy" para confirmar'
+        required: true
+
+env:
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  AWS_DEFAULT_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+jobs:
+  check-confirmation:
+    name: Verificar confirmación
+    runs-on: ubuntu-latest
+    steps:
+      - name: Abortar si no se confirmó
+        if: inputs.confirm != 'destroy'
+        run: |
+          echo "::error::Tenés que escribir exactamente 'destroy' en el input 'confirm' para continuar."
+          exit 1
+
+  destroy-ec2:
+    name: Limpiar stack EC2
+    needs: check-confirmation
+    if: inputs.target == 'ec2'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Terminar instancia (tag Name=cat-webserver)
+        run: |
+          set -euo pipefail
+          IDS=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=cat-webserver" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+            --query 'Reservations[].Instances[].InstanceId' --output text)
+
+          if [ -n "$IDS" ]; then
+            # shellcheck disable=SC2086 # IDS puede traer varios IDs separados por espacio a propósito
+            aws ec2 terminate-instances --instance-ids $IDS
+            # shellcheck disable=SC2086
+            aws ec2 wait instance-terminated --instance-ids $IDS
+            echo "Instancia(s) terminada(s): $IDS"
+          else
+            echo "No había instancias con tag Name=cat-webserver."
+          fi
+
+      - name: Borrar security group (cat-webserver-sg)
+        run: |
+          set -euo pipefail
+          SG_ID=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=cat-webserver-sg" \
+            --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || echo "None")
+          if [ -n "$SG_ID" ] && [ "$SG_ID" != "None" ]; then
+            aws ec2 delete-security-group --group-id "$SG_ID"
+            echo "Security group borrado: $SG_ID"
+          else
+            echo "No había security group cat-webserver-sg."
+          fi
+
+      - name: Borrar instance profile y rol IAM
+        run: |
+          set -euo pipefail
+          if aws iam get-instance-profile --instance-profile-name cat-webserver-instance-profile >/dev/null 2>&1; then
+            aws iam remove-role-from-instance-profile \
+              --instance-profile-name cat-webserver-instance-profile \
+              --role-name cat-webserver-role || true
+            aws iam delete-instance-profile --instance-profile-name cat-webserver-instance-profile
+          fi
+
+          if aws iam get-role --role-name cat-webserver-role >/dev/null 2>&1; then
+            for POLICY_ARN in \
+              arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore \
+              arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly; do
+              aws iam detach-role-policy --role-name cat-webserver-role --policy-arn "$POLICY_ARN" || true
+            done
+            aws iam delete-role --role-name cat-webserver-role
+            echo "Rol IAM cat-webserver-role borrado."
+          else
+            echo "No había rol cat-webserver-role."
+          fi
+
+      - name: Borrar repo ECR (cat-app)
+        run: |
+          set -euo pipefail
+          if aws ecr describe-repositories --repository-names cat-app >/dev/null 2>&1; then
+            aws ecr delete-repository --repository-name cat-app --force
+            echo "Repo ECR cat-app borrado."
+          else
+            echo "No había repo ECR cat-app."
+          fi
+
+  destroy-fargate:
+    name: Limpiar stack Fargate
+    needs: check-confirmation
+    if: inputs.target == 'fargate'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Escalar servicio a 0 y borrarlo
+        run: |
+          set -euo pipefail
+          if aws ecs describe-services --cluster cat-cluster --services cat-service \
+              --query 'services[0].status' --output text 2>/dev/null | grep -q ACTIVE; then
+            aws ecs update-service --cluster cat-cluster --service cat-service --desired-count 0
+            aws ecs wait services-stable --cluster cat-cluster --services cat-service
+            aws ecs delete-service --cluster cat-cluster --service cat-service
+            echo "Servicio cat-service borrado."
+          else
+            echo "No había servicio cat-service ACTIVE."
+          fi
+
+      - name: Desregistrar task definitions (familia cat-app)
+        run: |
+          set -euo pipefail
+          ARNS=$(aws ecs list-task-definitions --family-prefix cat-app --status ACTIVE --query 'taskDefinitionArns[]' --output text)
+          for ARN in $ARNS; do
+            aws ecs deregister-task-definition --task-definition "$ARN" >/dev/null
+          done
+          echo "Task definitions desregistradas: ${ARNS:-ninguna}"
+
+      - name: Borrar cluster
+        run: |
+          set -euo pipefail
+          if aws ecs describe-clusters --clusters cat-cluster --query 'clusters[0].status' --output text 2>/dev/null | grep -q ACTIVE; then
+            aws ecs delete-cluster --cluster cat-cluster
+            echo "Cluster cat-cluster borrado."
+          else
+            echo "No había cluster cat-cluster ACTIVE."
+          fi
+
+      - name: Borrar security group (cat-service-sg)
+        run: |
+          set -euo pipefail
+          SG_ID=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=cat-service-sg" \
+            --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || echo "None")
+          if [ -n "$SG_ID" ] && [ "$SG_ID" != "None" ]; then
+            aws ec2 delete-security-group --group-id "$SG_ID"
+            echo "Security group borrado: $SG_ID"
+          else
+            echo "No había security group cat-service-sg."
+          fi
+
+      - name: Borrar log group
+        run: |
+          aws logs delete-log-group --log-group-name /ecs/cat-app 2>/dev/null || echo "No había log group /ecs/cat-app."
+
+      - name: Borrar rol de ejecución IAM
+        run: |
+          set -euo pipefail
+          if aws iam get-role --role-name cat-app-execution-role >/dev/null 2>&1; then
+            aws iam detach-role-policy --role-name cat-app-execution-role \
+              --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy || true
+            aws iam delete-role --role-name cat-app-execution-role
+            echo "Rol IAM cat-app-execution-role borrado."
+          else
+            echo "No había rol cat-app-execution-role."
+          fi
+
+      - name: Borrar repo ECR (cat-app)
+        run: |
+          set -euo pipefail
+          if aws ecr describe-repositories --repository-names cat-app >/dev/null 2>&1; then
+            aws ecr delete-repository --repository-name cat-app --force
+            echo "Repo ECR cat-app borrado."
+          else
+            echo "No había repo ECR cat-app."
+          fi

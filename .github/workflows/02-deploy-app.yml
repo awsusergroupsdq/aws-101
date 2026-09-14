@@ -1,0 +1,170 @@
+name: "02 - Deploy App"
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "A dónde desplegar"
+        type: choice
+        options:
+          - ec2
+          - fargate
+        required: true
+
+env:
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  AWS_DEFAULT_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  ECR_REPO_NAME: cat-app
+
+jobs:
+  build-and-push:
+    name: Build y push a ECR
+    runs-on: ubuntu-latest
+    outputs:
+      image_uri: ${{ steps.image.outputs.uri }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login a ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Resolver URL del repo
+        id: repo
+        run: |
+          set -euo pipefail
+          REPO_URI=$(aws ecr describe-repositories \
+            --repository-names "$ECR_REPO_NAME" \
+            --query 'repositories[0].repositoryUri' --output text)
+          echo "uri=$REPO_URI" >> "$GITHUB_OUTPUT"
+
+      - name: Build y push de la imagen
+        id: image
+        env:
+          REPO_URI: ${{ steps.repo.outputs.uri }}
+        run: |
+          set -euo pipefail
+          docker build \
+            -t "$REPO_URI:latest" \
+            -t "$REPO_URI:${{ github.sha }}" \
+            docker/app
+          docker push "$REPO_URI:latest"
+          docker push "$REPO_URI:${{ github.sha }}"
+          echo "uri=$REPO_URI:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+  deploy-ec2:
+    name: Deploy a EC2 (SSM)
+    needs: build-and-push
+    if: inputs.target == 'ec2'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Buscar instancia por tag Name=cat-webserver
+        id: instance
+        run: |
+          set -euo pipefail
+          INSTANCE_ID=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=cat-webserver" "Name=instance-state-name,Values=running" \
+            --query 'Reservations[0].Instances[0].InstanceId' --output text)
+
+          if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" == "None" ]; then
+            echo "::error::No encontré ninguna instancia EC2 corriendo con tag Name=cat-webserver. Corré primero el workflow '01 - Provision: EC2' (action: apply)."
+            exit 1
+          fi
+
+          echo "id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy vía SSM RunCommand
+        id: ssm
+        env:
+          INSTANCE_ID: ${{ steps.instance.outputs.id }}
+        run: |
+          set -euo pipefail
+          REGISTRY=$(echo "${{ needs.build-and-push.outputs.image_uri }}" | cut -d/ -f1)
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy cat-app ${{ github.sha }}" \
+            --parameters commands="[
+              \"set -eux\",
+              \"aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $REGISTRY\",
+              \"docker pull ${{ needs.build-and-push.outputs.image_uri }}\",
+              \"docker stop cat-app || true\",
+              \"docker rm cat-app || true\",
+              \"docker run -d --name cat-app --restart unless-stopped -p 80:80 ${{ needs.build-and-push.outputs.image_uri }}\"
+            ]" \
+            --query 'Command.CommandId' --output text)
+
+          echo "command_id=$COMMAND_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Esperar resultado del comando
+        env:
+          INSTANCE_ID: ${{ steps.instance.outputs.id }}
+          COMMAND_ID: ${{ steps.ssm.outputs.command_id }}
+        run: |
+          set -euo pipefail
+          aws ssm wait command-executed --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" || true
+
+          STATUS=$(aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
+            --query 'Status' --output text)
+
+          echo "--- stdout ---"
+          aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --query 'StandardOutputContent' --output text
+          echo "--- stderr ---"
+          aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --query 'StandardErrorContent' --output text
+
+          if [ "$STATUS" != "Success" ]; then
+            echo "::error::El comando SSM terminó con status $STATUS"
+            exit 1
+          fi
+
+      - name: Resumen
+        env:
+          INSTANCE_ID: ${{ steps.instance.outputs.id }}
+        run: |
+          IP=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+          {
+            echo "### Deploy a EC2 completo"
+            echo "App disponible en: http://$IP"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy-fargate:
+    name: Deploy a Fargate
+    needs: build-and-push
+    if: inputs.target == 'fargate'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verificar que el cluster/servicio existan
+        run: |
+          set -euo pipefail
+          STATUS=$(aws ecs describe-services \
+            --cluster cat-cluster --services cat-service \
+            --query 'services[0].status' --output text 2>/dev/null || echo "MISSING")
+
+          if [ "$STATUS" != "ACTIVE" ]; then
+            echo "::error::No encontré el servicio 'cat-service' ACTIVE en el cluster 'cat-cluster'. Corré primero el workflow '01 - Provision: Fargate' (action: apply)."
+            exit 1
+          fi
+
+      - name: Forzar nuevo deployment
+        run: |
+          aws ecs update-service \
+            --cluster cat-cluster \
+            --service cat-service \
+            --force-new-deployment \
+            --query 'service.serviceName' --output text
+
+      - name: Esperar a que el servicio se estabilice
+        run: |
+          aws ecs wait services-stable --cluster cat-cluster --services cat-service
+
+      - name: Resumen
+        run: |
+          {
+            echo "### Deploy a Fargate completo"
+            echo "Servicio \`cat-service\` estabilizado con la imagen \`${{ github.sha }}\`."
+            echo "Buscá la IP pública de la task en la consola de ECS (Fargate no usa ALB en esta demo)."
+          } >> "$GITHUB_STEP_SUMMARY"

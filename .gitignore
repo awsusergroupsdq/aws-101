@@ -1,0 +1,61 @@
+# --- OpenTofu / Terraform ---
+**/.terraform/
+**/.terraform.tfstate.lock.info
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+!*.tfvars.example
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# --- AWS ---
+.aws/
+*.pem
+credentials
+credentials.csv
+
+# --- Secretos / env ---
+.env
+.env.*
+!.env.example
+*.key
+*.pfx
+*_rsa
+*_rsa.pub
+secrets.yml
+secrets.yaml
+
+# --- Claude Code / asistentes de IA (config y estado local, nunca al repo público) ---
+.claude/
+.claude.json
+.claude.json.backup
+CLAUDE.local.md
+.mcp.json
+.cursor/
+.cursorrules
+.windsurfrules
+.aider*
+.copilot/
+
+# --- Node (por si docker/app suma tooling más adelante) ---
+node_modules/
+npm-debug.log*
+
+# --- Docker ---
+docker/app/.env
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# --- Misc ---
+*.log
+*.tmp
