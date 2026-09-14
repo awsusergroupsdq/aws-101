@@ -73,6 +73,19 @@ te lo pidan.
    y escribiendo `destroy` en la confirmación, para no dejar nada corriendo
    en la cuenta.
 
+## Si probás el build localmente antes del workshop
+
+Los workflows de GitHub Actions corren en runners `ubuntu-latest` (amd64), la
+misma arquitectura que las instancias EC2 y las tasks de Fargate — no hace
+falta hacer nada especial ahí. Pero si buildeás y pusheás la imagen a mano
+desde una Mac Apple Silicon (M1/M2/M3, arm64), el container va a crashear en
+EC2/Fargate con `exec format error`. Para probar local, forzá la
+arquitectura:
+
+```bash
+docker build --platform linux/amd64 -t <repo>:latest docker/app
+```
+
 ## Red
 
 Ambos stacks usan la **VPC y subnets default** de la cuenta — no crean red
