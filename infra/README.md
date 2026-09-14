@@ -15,10 +15,13 @@ el ECR) antes de provisionar el otro.
 
 ## Decisión de diseño: state local/efímero
 
-**No hay backend remoto.** El `tofu apply` corre dentro de un job de GitHub
-Actions (workflows `01-provision-*`), y el archivo de state vive solo
-mientras ese job está corriendo — no se guarda como artifact, ni en S3, ni
-en ningún otro lado. Es una decisión deliberada para mantener el workshop
+**No hay backend remoto.** Para el workshop en sí, el `tofu apply` corre
+dentro de un job de GitHub Actions (workflows `01-provision-*`), y ahí el
+archivo de state vive solo mientras ese job está corriendo — no se guarda
+como artifact, ni en S3, ni en ningún otro lado. (Si en cambio corrés
+`tofu apply` en local — ver "Opción B" en la sección [Cómo usar](#cómo-usar)
+más abajo — el state queda en tu disco entre corridas, como cualquier uso
+normal de Terraform/OpenTofu.) Es una decisión deliberada para mantener el workshop
 simple (sin bucket + DynamoDB de locking que configurar antes de la charla).
 
 Esto tiene dos consecuencias directas en el código, y son intencionales —
@@ -62,29 +65,70 @@ te lo pidan.
 | `AWS_SECRET_ACCESS_KEY` | Secret | Secret key correspondiente |
 | `AWS_REGION` | Variable (opcional) | Región a usar; default `us-east-1` si no se define |
 
-## Orden de uso durante el workshop
+## Cómo usar
 
-1. **`01 - Provision: EC2`** o **`01 - Provision: Fargate`** (action: `plan`
-   primero para revisar, después `apply`) — elegí uno.
-2. **`02 - Deploy App`** (target: `ec2` o `fargate`, según lo que hayas
-   provisionado) — build de la imagen desde [`docker/app`](../docker/app),
-   push a ECR, y deploy (SSM en EC2, `force-new-deployment` en Fargate).
-3. Al terminar la charla: **`03 - Destroy`** con el `target` correspondiente
-   y escribiendo `destroy` en la confirmación, para no dejar nada corriendo
-   en la cuenta.
+El flujo siempre es el mismo — **provisionar → desplegar → (al final)
+destruir** — elegí un stack (EC2 o Fargate) y no lo mezcles con el otro.
+Dos formas de correrlo: vía GitHub Actions (la forma pensada para el
+workshop) o en local (para armar/probar todo antes de la charla).
 
-## Si probás el build localmente antes del workshop
+### Opción A — GitHub Actions (recomendado para el día del workshop)
 
-Los workflows de GitHub Actions corren en runners `ubuntu-latest` (amd64), la
-misma arquitectura que las instancias EC2 y las tasks de Fargate — no hace
-falta hacer nada especial ahí. Pero si buildeás y pusheás la imagen a mano
-desde una Mac Apple Silicon (M1/M2/M3, arm64), el container va a crashear en
-EC2/Fargate con `exec format error`. Para probar local, forzá la
-arquitectura:
+Requiere tener cargados los Secrets/Variables de la [tabla de
+arriba](#secrets-y-variables-necesarios-en-el-repo-de-github) en el repo.
+
+1. Pestaña **Actions** del repo → elegí **`01 - Provision: EC2`** o
+   **`01 - Provision: Fargate`** → **Run workflow** → `action: plan` primero
+   para revisar qué va a crear, corré de nuevo con `action: apply` cuando
+   estés conforme.
+2. **`02 - Deploy App`** → **Run workflow** → `target: ec2` o `target:
+   fargate` (el mismo que provisionaste). Buildea `docker/app`, lo publica
+   en ECR y lo despliega.
+3. Repetí el paso 2 cada vez que cambies algo en `docker/app` — no hace
+   falta volver a provisionar.
+4. Al terminar la charla: **`03 - Destroy`** → **Run workflow** → mismo
+   `target`, y escribí `destroy` en el campo `confirm` para que corra.
+
+### Opción B — Local (para armar/iterar antes del workshop)
+
+Necesitás `tofu`, `docker` y `aws` CLI con credenciales configuradas
+(`aws configure` o variables `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`
+/ `AWS_DEFAULT_REGION` en tu shell) — acá el state SÍ queda en tu disco
+(`infra/*/terraform.tfstate`, gitignored), así que un `tofu destroy` local
+funciona normal, a diferencia del workflow `03-destroy`.
 
 ```bash
-docker build --platform linux/amd64 -t <repo>:latest docker/app
+# 1) Provisionar (elegí un stack)
+cd infra/base-ec2   # o infra/base-fargate
+tofu init
+tofu plan
+tofu apply
+
+# 2) Build + push de la imagen (mismo repo ECR que acaba de crear el apply)
+REPO_URI=$(aws ecr describe-repositories --repository-names cat-app --query 'repositories[0].repositoryUri' --output text)
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin "${REPO_URI%%/*}"
+docker build --platform linux/amd64 -t "${REPO_URI}:latest" ../../docker/app   # ver nota de arquitectura abajo
+docker push "${REPO_URI}:latest"
+
+# 3a) Deploy a EC2: instancia por tag Name=cat-webserver, vía SSM
+INSTANCE_ID=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=cat-webserver" "Name=instance-state-name,Values=running" --query 'Reservations[0].Instances[0].InstanceId' --output text)
+aws ssm send-command --instance-ids "$INSTANCE_ID" --document-name AWS-RunShellScript \
+  --parameters commands="[\"docker pull ${REPO_URI}:latest\",\"docker stop cat-app || true\",\"docker rm cat-app || true\",\"docker run -d --name cat-app --restart unless-stopped -p 80:80 ${REPO_URI}:latest\"]"
+
+# 3b) — o — Deploy a Fargate
+aws ecs update-service --cluster cat-cluster --service cat-service --force-new-deployment
+aws ecs wait services-stable --cluster cat-cluster --services cat-service
+
+# 4) Al terminar: destruir el stack que hayas provisionado
+cd infra/base-ec2   # o infra/base-fargate
+tofu destroy
 ```
+
+**Nota de arquitectura:** los runners de GitHub Actions (`ubuntu-latest`)
+son amd64, igual que EC2/Fargate — la Opción A no necesita nada especial.
+Pero si buildeás en local desde una Mac Apple Silicon (M1/M2/M3, arm64), el
+container va a crashear en EC2/Fargate con `exec format error` si no forzás
+la arquitectura con `--platform linux/amd64` como en el comando de arriba.
 
 ## Red
 
