@@ -9,3 +9,15 @@ variable "instance_type" {
   type        = string
   default     = "t3.micro"
 }
+
+variable "my_ip_cidr" {
+  description = <<-EOT
+    CIDR permitido para SSH (puerto 22), pensado para que el presentador
+    pueda entrar directo a la instancia además de por SSM. Dejalo vacío
+    ("") para que se detecte tu IP pública automáticamente en el apply
+    (vía https://checkip.amazonaws.com), o pasá la tuya explícita, ej.
+    "203.0.113.10/32".
+  EOT
+  type        = string
+  default     = ""
+}

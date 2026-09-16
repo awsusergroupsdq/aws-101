@@ -16,6 +16,16 @@ data "aws_ssm_parameter" "al2023_ami" {
   name = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
 }
 
+# --- Mi IP pública, para restringir el SSH solo al presentador. ---
+# Si var.my_ip_cidr viene vacío, se detecta automáticamente en cada apply.
+data "http" "my_ip" {
+  url = "https://checkip.amazonaws.com"
+}
+
+locals {
+  my_ip_cidr = var.my_ip_cidr != "" ? var.my_ip_cidr : "${chomp(data.http.my_ip.response_body)}/32"
+}
+
 # --- ECR: repo compartido de nombre "cat-app" con el stack de Fargate (alternativo, no simultáneo). ---
 
 resource "aws_ecr_repository" "cat_app" {
@@ -60,11 +70,12 @@ resource "aws_iam_instance_profile" "ec2_profile" {
   role = aws_iam_role.ec2_role.name
 }
 
-# --- Networking de la instancia: solo HTTP entrante. Sin SSH — el acceso es por SSM. ---
+# --- Networking de la instancia: HTTP para todo el mundo, SSH solo para el presentador. ---
+# El deploy en sí sigue siendo por SSM (no depende de esta regla de SSH).
 
 resource "aws_security_group" "web" {
   name        = "cat-webserver-sg"
-  description = "Permite HTTP entrante para la demo de cat-app"
+  description = "Permite HTTP entrante para la demo de cat-app, y SSH solo desde la IP del presentador"
   vpc_id      = data.aws_vpc.default.id
 
   ingress {
@@ -73,6 +84,14 @@ resource "aws_security_group" "web" {
     to_port     = 80
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "SSH (solo la IP del presentador, ver var.my_ip_cidr)"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = [local.my_ip_cidr]
   }
 
   egress {
@@ -87,6 +106,18 @@ resource "aws_security_group" "web" {
   }
 }
 
+# --- Key pair para SSH: generado por tofu, la private key vive solo en el state local
+#     (mismo trade-off de "todo efímero" que el resto del stack — nunca se commitea). ---
+
+resource "tls_private_key" "ssh" {
+  algorithm = "ED25519"
+}
+
+resource "aws_key_pair" "ssh" {
+  key_name   = "cat-webserver-key"
+  public_key = tls_private_key.ssh.public_key_openssh
+}
+
 # --- EC2: solo instala Docker. El pull + run de la imagen lo hace 02-deploy-app vía SSM,
 #     porque en el primer apply el repo de ECR todavía está vacío. ---
 
@@ -96,6 +127,7 @@ resource "aws_instance" "web" {
   subnet_id              = data.aws_subnets.default.ids[0]
   vpc_security_group_ids = [aws_security_group.web.id]
   iam_instance_profile   = aws_iam_instance_profile.ec2_profile.name
+  key_name               = aws_key_pair.ssh.key_name
 
   user_data = <<-EOF
     #!/bin/bash

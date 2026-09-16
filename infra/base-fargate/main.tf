@@ -58,6 +58,33 @@ resource "aws_iam_role_policy_attachment" "execution_role_policy" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
+# --- IAM: task role para ECS Exec — shell interactivo dentro del container, vía SSM.
+#     Fargate no tiene un host al que hacerle SSH; esto es el equivalente sin abrir
+#     ningún puerto (a diferencia del SSH que sí se agrega en base-ec2). ---
+
+resource "aws_iam_role" "task_role" {
+  name               = "cat-app-task-role"
+  assume_role_policy = data.aws_iam_policy_document.ecs_task_assume_role.json
+}
+
+data "aws_iam_policy_document" "ecs_exec" {
+  statement {
+    actions = [
+      "ssmmessages:CreateControlChannel",
+      "ssmmessages:CreateDataChannel",
+      "ssmmessages:OpenControlChannel",
+      "ssmmessages:OpenDataChannel",
+    ]
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_role_policy" "task_role_exec" {
+  name   = "ecs-exec"
+  role   = aws_iam_role.task_role.id
+  policy = data.aws_iam_policy_document.ecs_exec.json
+}
+
 # --- Networking del servicio: solo HTTP entrante. Sin ALB (no hace falta para la demo). ---
 
 resource "aws_security_group" "service" {
@@ -95,6 +122,7 @@ resource "aws_ecs_task_definition" "cat_app" {
   cpu                      = var.task_cpu
   memory                   = var.task_memory
   execution_role_arn       = aws_iam_role.execution_role.arn
+  task_role_arn            = aws_iam_role.task_role.arn
 
   container_definitions = jsonencode([
     {
@@ -120,11 +148,12 @@ resource "aws_ecs_task_definition" "cat_app" {
 }
 
 resource "aws_ecs_service" "cat_service" {
-  name            = local.service_name
-  cluster         = aws_ecs_cluster.cat_cluster.id
-  task_definition = aws_ecs_task_definition.cat_app.arn
-  desired_count   = 1
-  launch_type     = "FARGATE"
+  name                   = local.service_name
+  cluster                = aws_ecs_cluster.cat_cluster.id
+  task_definition        = aws_ecs_task_definition.cat_app.arn
+  desired_count          = 1
+  launch_type            = "FARGATE"
+  enable_execute_command = true # habilita `aws ecs execute-command` (shell vía SSM, sin puertos)
 
   network_configuration {
     subnets          = data.aws_subnets.default.ids

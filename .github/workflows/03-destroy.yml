@@ -113,6 +113,16 @@ jobs:
             echo "No había repo ECR cat-app."
           fi
 
+      - name: Borrar key pair SSH (cat-webserver-key)
+        run: |
+          set -euo pipefail
+          if aws ec2 describe-key-pairs --key-names cat-webserver-key >/dev/null 2>&1; then
+            aws ec2 delete-key-pair --key-name cat-webserver-key
+            echo "Key pair cat-webserver-key borrada."
+          else
+            echo "No había key pair cat-webserver-key."
+          fi
+
   destroy-fargate:
     name: Limpiar stack Fargate
     needs: check-confirmation
@@ -178,6 +188,17 @@ jobs:
             echo "Rol IAM cat-app-execution-role borrado."
           else
             echo "No había rol cat-app-execution-role."
+          fi
+
+      - name: Borrar task role de ECS Exec (cat-app-task-role)
+        run: |
+          set -euo pipefail
+          if aws iam get-role --role-name cat-app-task-role >/dev/null 2>&1; then
+            aws iam delete-role-policy --role-name cat-app-task-role --policy-name ecs-exec || true
+            aws iam delete-role --role-name cat-app-task-role
+            echo "Rol IAM cat-app-task-role borrado."
+          else
+            echo "No había rol cat-app-task-role."
           fi
 
       - name: Borrar repo ECR (cat-app)

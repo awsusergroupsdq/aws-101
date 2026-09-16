@@ -103,6 +103,7 @@ cd infra/base-ec2   # o infra/base-fargate
 tofu init
 tofu plan
 tofu apply
+tofu output   # todos los comandos que necesitás después salen de acá
 
 # 2) Build + push de la imagen (mismo repo ECR que acaba de crear el apply)
 REPO_URI=$(aws ecr describe-repositories --repository-names cat-app --query 'repositories[0].repositoryUri' --output text)
@@ -138,9 +139,15 @@ propia, para minimizar lo que hay que explicar/depurar en vivo.
 ## EC2 (`base-ec2/`)
 
 - `t3.micro`, Amazon Linux 2023 (resuelta vía SSM Parameter Store).
-- Sin acceso SSH: el security group solo abre `80/tcp` entrante. El deploy
-  y cualquier comando remoto se hacen vía **SSM Run Command**, para lo cual
-  la instancia tiene el rol `AmazonSSMManagedInstanceCore`.
+- El deploy y cualquier comando remoto automatizado se hacen vía **SSM Run
+  Command**, para lo cual la instancia tiene el rol
+  `AmazonSSMManagedInstanceCore` — eso no depende de ningún puerto abierto.
+- El security group abre `80/tcp` a todo el mundo (la demo) y `22/tcp`
+  **solo a la IP del presentador**, para poder entrar por SSH a debuggear en
+  vivo además de SSM. El `apply` genera un key pair nuevo (`tls_private_key`
+  + `aws_key_pair`) y detecta tu IP pública automáticamente — todo queda
+  en los outputs (`ssh_command`, `my_ip_cidr`, `ssh_private_key_pem`). Ver
+  variable `my_ip_cidr` si querés fijar la IP a mano en vez de auto-detectarla.
 - El `user_data` solo instala y arranca Docker — **no** corre el container.
   En el primer `apply` el repo de ECR todavía está vacío, así que el pull y
   el `docker run` los hace `02-deploy-app` la primera vez que se despliega.
@@ -150,8 +157,16 @@ propia, para minimizar lo que hay que explicar/depurar en vivo.
 - Cluster `cat-cluster`, servicio `cat-service`, 1 task deseada.
 - Sin ALB: la task tiene IP pública asignada directamente
   (`assign_public_ip = true`), para no sumar el costo/complejidad de un load
-  balancer en una demo corta. Buscá la IP en la consola de ECS después del
-  deploy.
+  balancer en una demo corta. El output `find_ip_command` te da el comando
+  de AWS CLI listo para conseguir esa IP después del deploy.
 - La task definition apunta a `cat-app:latest` en ECR desde el primer
   `apply`, cuando el repo todavía está vacío — es normal que las tasks
   fallen el pull hasta que `02-deploy-app` publique la primera imagen.
+- Fargate no tiene un host al que hacerle SSH, así que en vez de eso el
+  servicio tiene **ECS Exec** habilitado (`enable_execute_command = true`
+  + un task role con permisos de `ssmmessages:*`): shell interactivo dentro
+  del container vía SSM, sin abrir ningún puerto. Los outputs
+  `list_tasks_command` y `exec_command_template` te dan los comandos listos
+  (necesitás el [Session Manager
+  plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html)
+  de AWS CLI instalado en tu máquina).
