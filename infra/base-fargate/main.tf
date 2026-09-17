@@ -112,8 +112,11 @@ resource "aws_security_group" "service" {
   }
 }
 
-# --- Task definition: en el primer apply el repo de ECR está vacío, así que las tasks
-#     van a fallar el pull hasta que 02-deploy-app publique una imagen. Es esperado. ---
+# --- Task definition: apunta a cat-app:latest. Al crear el servicio (más abajo) la
+#     primera task intenta arrancar antes de que exista la imagen (el ECR recién se
+#     llena en null_resource.build_and_push, después) — esa primera task falla el
+#     pull, y el null_resource.deploy la reemplaza con un force-new-deployment una
+#     vez que la imagen ya está publicada. Es esperado, y pasa dentro del mismo apply. ---
 
 resource "aws_ecs_task_definition" "cat_app" {
   family                   = local.family_name
@@ -160,4 +163,57 @@ resource "aws_ecs_service" "cat_service" {
     security_groups  = [aws_security_group.service.id]
     assign_public_ip = true
   }
+}
+
+# --- Build + push: corre DENTRO del apply, no en un workflow aparte.
+#     Se dispara de nuevo (hash de docker/app) cada vez que cambia el código de la
+#     app, así que "tofu apply" también sirve para redesplegar sin tocar la infra. ---
+
+resource "null_resource" "build_and_push" {
+  triggers = {
+    app_sha1 = sha1(join("", [
+      for f in fileset("${path.module}/../../docker/app", "**") :
+      filesha1("${path.module}/../../docker/app/${f}")
+    ]))
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      set -euo pipefail
+      REPO="${aws_ecr_repository.cat_app.repository_url}"
+      aws ecr get-login-password --region ${var.aws_region} \
+        | docker login --username AWS --password-stdin "$${REPO%%/*}"
+      docker build --platform linux/amd64 -t "$REPO:latest" "${path.module}/../../docker/app"
+      docker push "$REPO:latest"
+    EOT
+  }
+}
+
+# --- Deploy: fuerza un nuevo deployment del servicio y espera a que estabilice.
+#     Se re-dispara cada vez que hay una imagen nueva. ---
+
+resource "null_resource" "deploy" {
+  triggers = {
+    image_id = null_resource.build_and_push.id
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      set -euo pipefail
+      aws ecs update-service \
+        --cluster ${aws_ecs_cluster.cat_cluster.name} \
+        --service ${aws_ecs_service.cat_service.name} \
+        --force-new-deployment \
+        --region ${var.aws_region} >/dev/null
+      aws ecs wait services-stable \
+        --cluster ${aws_ecs_cluster.cat_cluster.name} \
+        --services ${aws_ecs_service.cat_service.name} \
+        --region ${var.aws_region}
+      echo "Servicio estabilizado."
+    EOT
+  }
+
+  depends_on = [null_resource.build_and_push, aws_ecs_service.cat_service]
 }

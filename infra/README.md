@@ -2,6 +2,8 @@
 
 Dos stacks de OpenTofu **alternativos** para desplegar `cat-app` (ver
 [docker/app](../docker/app)): elegí uno u otro, no los corras a la vez.
+**Un solo `tofu apply` hace todo** — provisiona la infra, buildea la imagen,
+la publica en ECR y la despliega. No hay un paso de "deploy" separado.
 
 | Stack | Cómputo | Cuándo usarlo |
 |---|---|---|
@@ -13,7 +15,36 @@ si aplicás uno con el otro ya desplegado, `tofu apply` va a fallar porque el
 repo ya existe. Destruí un stack completo (workflow **03-destroy**, incluye
 el ECR) antes de provisionar el otro.
 
-## Decisión de diseño: state local/efímero
+## Decisión de diseño: todo pasa por `tofu apply`, un solo comando
+
+Cada stack tiene, además de los recursos de infra, dos `null_resource` con
+`local-exec` (ver el final de cada `main.tf`):
+
+1. **`null_resource.build_and_push`** — hace `docker build --platform
+   linux/amd64` + `docker push` a ECR. Se dispara de nuevo cada vez que
+   cambia el contenido de `docker/app` (está hasheado en el `trigger`), así
+   que correr `tofu apply` otra vez después de editar la app también la
+   redespliega, sin tocar el resto de la infra.
+2. **`null_resource.deploy`** — en EC2, espera a que el agente de SSM esté
+   online y manda el `docker pull` + `run` remoto; en Fargate, hace
+   `force-new-deployment` y espera a que el servicio estabilice.
+
+**Por qué está armado así:** al principio el deploy vivía en un workflow de
+GitHub Actions aparte (`02-deploy-app`), que había que acordarse de correr
+después de provisionar. En la práctica eso generaba un estado a medio
+armar — instancia/cluster levantados pero sin la app corriendo todavía
+("connection refused" al abrir la IP) — cada vez que alguien corría
+`01-provision-*` y se olvidaba el segundo paso. Meter el build+push+deploy
+adentro del propio `apply` (vía `local-exec`) elimina ese paso intermedio:
+**si `tofu apply` terminó bien, la app ya está andando.**
+
+**Consecuencia:** `docker` y `aws` CLI dejan de ser "opcionales solo para
+probar en local" — son **requeridos** en cualquier lugar donde corra
+`tofu apply`, workflow de GitHub Actions incluido. Los runners
+`ubuntu-latest` de GitHub Actions ya traen ambos preinstalados, así que la
+Opción A de abajo no necesita nada extra.
+
+## State local/efímero
 
 **No hay backend remoto.** Para el workshop en sí, el `tofu apply` corre
 dentro de un job de GitHub Actions (workflows `01-provision-*`), y ahí el
@@ -21,8 +52,9 @@ archivo de state vive solo mientras ese job está corriendo — no se guarda
 como artifact, ni en S3, ni en ningún otro lado. (Si en cambio corrés
 `tofu apply` en local — ver "Opción B" en la sección [Cómo usar](#cómo-usar)
 más abajo — el state queda en tu disco entre corridas, como cualquier uso
-normal de Terraform/OpenTofu.) Es una decisión deliberada para mantener el workshop
-simple (sin bucket + DynamoDB de locking que configurar antes de la charla).
+normal de Terraform/OpenTofu.) Es una decisión deliberada para mantener el
+workshop simple (sin bucket + DynamoDB de locking que configurar antes de
+la charla).
 
 Esto tiene dos consecuencias directas en el código, y son intencionales —
 **no son bugs**:
@@ -31,11 +63,8 @@ Esto tiene dos consecuencias directas en el código, y son intencionales —
    (`cat-webserver`, `cat-cluster`, `cat-service`, `cat-app`) en vez de
    generarse dinámicamente y pasarse vía `output` de tofu. No hay state
    persistente del que leer esos outputs entre workflows distintos.
-2. **El workflow de deploy (`02-deploy-app`) busca los recursos por
-   tag/nombre con AWS CLI** (`aws ec2 describe-instances --filters
-   Name=tag:Name,Values=cat-webserver`, `aws ecs describe-services
-   --cluster cat-cluster --services cat-service`), no con
-   `terraform_remote_state` ni `tofu output`.
+2. **El destroy busca los recursos por tag/nombre con AWS CLI** (ver
+   abajo), no con `terraform_remote_state` ni `tofu output`.
 
 **Consecuencia para `03-destroy`:** como el state nunca persiste entre runs
 de GitHub Actions, un `tofu destroy` en CI no tendría ningún state del que
@@ -46,9 +75,9 @@ mismo nombre/tag hardcodeado que usan los stacks. Verificá siempre en la
 consola de AWS después de correrlo.
 
 Si en algún momento se suma un backend remoto (S3 + DynamoDB, o Terraform
-Cloud), estas tres cosas dejan de aplicar y se podría volver a un flujo con
-outputs + `tofu destroy` normal — pero es un cambio de diseño a propósito,
-no algo para hacer sin avisar.
+Cloud), esto deja de aplicar y se podría volver a un flujo con outputs +
+`tofu destroy` normal — pero es un cambio de diseño a propósito, no algo
+para hacer sin avisar.
 
 ## Auth de GitHub Actions a AWS
 
@@ -67,10 +96,9 @@ te lo pidan.
 
 ## Cómo usar
 
-El flujo siempre es el mismo — **provisionar → desplegar → (al final)
-destruir** — elegí un stack (EC2 o Fargate) y no lo mezcles con el otro.
-Dos formas de correrlo: vía GitHub Actions (la forma pensada para el
-workshop) o en local (para armar/probar todo antes de la charla).
+Un stack (EC2 o Fargate), un solo `apply` para tener todo andando. Dos
+formas de correrlo: vía GitHub Actions (la forma pensada para el workshop)
+o en local (para armar/probar todo antes de la charla).
 
 ### Opción A — GitHub Actions (recomendado para el día del workshop)
 
@@ -80,56 +108,43 @@ arriba](#secrets-y-variables-necesarios-en-el-repo-de-github) en el repo.
 1. Pestaña **Actions** del repo → elegí **`01 - Provision: EC2`** o
    **`01 - Provision: Fargate`** → **Run workflow** → `action: plan` primero
    para revisar qué va a crear, corré de nuevo con `action: apply` cuando
-   estés conforme.
-2. **`02 - Deploy App`** → **Run workflow** → `target: ec2` o `target:
-   fargate` (el mismo que provisionaste). Buildea `docker/app`, lo publica
-   en ECR y lo despliega.
-3. Repetí el paso 2 cada vez que cambies algo en `docker/app` — no hace
-   falta volver a provisionar.
-4. Al terminar la charla: **`03 - Destroy`** → **Run workflow** → mismo
+   estés conforme. Al terminar, la app ya está desplegada — el resumen del
+   job trae el `tofu output` completo (IP, comandos de SSH/exec, etc.).
+2. ¿Cambiaste algo en `docker/app`? Corré el mismo workflow de nuevo con
+   `action: apply` — el `null_resource` detecta el cambio y redespliega
+   solo la app, sin tocar el resto de la infra.
+3. Al terminar la charla: **`03 - Destroy`** → **Run workflow** → mismo
    `target`, y escribí `destroy` en el campo `confirm` para que corra.
 
 ### Opción B — Local (para armar/iterar antes del workshop)
 
-Necesitás `tofu`, `docker` y `aws` CLI con credenciales configuradas
-(`aws configure` o variables `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`
-/ `AWS_DEFAULT_REGION` en tu shell) — acá el state SÍ queda en tu disco
-(`infra/*/terraform.tfstate`, gitignored), así que un `tofu destroy` local
-funciona normal, a diferencia del workflow `03-destroy`.
+Necesitás `tofu`, `docker` (con el daemon corriendo) y `aws` CLI con
+credenciales configuradas (`aws configure` o variables
+`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_DEFAULT_REGION` en tu
+shell) — acá el state SÍ queda en tu disco (`infra/*/terraform.tfstate`,
+gitignored), así que un `tofu destroy` local funciona normal, a diferencia
+del workflow `03-destroy`.
 
 ```bash
-# 1) Provisionar (elegí un stack)
+# 1) Provisionar + desplegar (elegí un stack) — un solo comando
 cd infra/base-ec2   # o infra/base-fargate
 tofu init
-tofu plan
 tofu apply
-tofu output   # todos los comandos que necesitás después salen de acá
+tofu output   # IP, comando de SSH/exec, todo lo que necesitás sale de acá
 
-# 2) Build + push de la imagen (mismo repo ECR que acaba de crear el apply)
-REPO_URI=$(aws ecr describe-repositories --repository-names cat-app --query 'repositories[0].repositoryUri' --output text)
-aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin "${REPO_URI%%/*}"
-docker build --platform linux/amd64 -t "${REPO_URI}:latest" ../../docker/app   # ver nota de arquitectura abajo
-docker push "${REPO_URI}:latest"
+# 2) ¿Cambiaste docker/app? Repetí el apply — redespliega solo la app
+tofu apply
 
-# 3a) Deploy a EC2: instancia por tag Name=cat-webserver, vía SSM
-INSTANCE_ID=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=cat-webserver" "Name=instance-state-name,Values=running" --query 'Reservations[0].Instances[0].InstanceId' --output text)
-aws ssm send-command --instance-ids "$INSTANCE_ID" --document-name AWS-RunShellScript \
-  --parameters commands="[\"docker pull ${REPO_URI}:latest\",\"docker stop cat-app || true\",\"docker rm cat-app || true\",\"docker run -d --name cat-app --restart unless-stopped -p 80:80 ${REPO_URI}:latest\"]"
-
-# 3b) — o — Deploy a Fargate
-aws ecs update-service --cluster cat-cluster --service cat-service --force-new-deployment
-aws ecs wait services-stable --cluster cat-cluster --services cat-service
-
-# 4) Al terminar: destruir el stack que hayas provisionado
-cd infra/base-ec2   # o infra/base-fargate
+# 3) Al terminar: destruir el stack que hayas provisionado
 tofu destroy
 ```
 
 **Nota de arquitectura:** los runners de GitHub Actions (`ubuntu-latest`)
 son amd64, igual que EC2/Fargate — la Opción A no necesita nada especial.
-Pero si buildeás en local desde una Mac Apple Silicon (M1/M2/M3, arm64), el
-container va a crashear en EC2/Fargate con `exec format error` si no forzás
-la arquitectura con `--platform linux/amd64` como en el comando de arriba.
+Pero si corrés `tofu apply` en local desde una Mac Apple Silicon (M1/M2/M3,
+arm64), fijate que el `docker build` de los `null_resource` ya fuerza
+`--platform linux/amd64` — no hace falta que hagas nada vos, pero por eso
+el build tarda un poco más (emula la arquitectura) que un build nativo.
 
 ## Red
 
@@ -148,9 +163,10 @@ propia, para minimizar lo que hay que explicar/depurar en vivo.
   + `aws_key_pair`) y detecta tu IP pública automáticamente — todo queda
   en los outputs (`ssh_command`, `my_ip_cidr`, `ssh_private_key_pem`). Ver
   variable `my_ip_cidr` si querés fijar la IP a mano en vez de auto-detectarla.
-- El `user_data` solo instala y arranca Docker — **no** corre el container.
-  En el primer `apply` el repo de ECR todavía está vacío, así que el pull y
-  el `docker run` los hace `02-deploy-app` la primera vez que se despliega.
+- El `user_data` instala y arranca Docker. El `null_resource.deploy` espera
+  a que el agente de SSM esté online (puede tardar uno o dos minutos desde
+  que la instancia arranca) antes de mandar el `docker pull` + `run` —
+  por eso el `apply` completo tarda un par de minutos, no es que se colgó.
 
 ## Fargate (`base-fargate/`)
 
@@ -158,10 +174,13 @@ propia, para minimizar lo que hay que explicar/depurar en vivo.
 - Sin ALB: la task tiene IP pública asignada directamente
   (`assign_public_ip = true`), para no sumar el costo/complejidad de un load
   balancer en una demo corta. El output `find_ip_command` te da el comando
-  de AWS CLI listo para conseguir esa IP después del deploy.
-- La task definition apunta a `cat-app:latest` en ECR desde el primer
-  `apply`, cuando el repo todavía está vacío — es normal que las tasks
-  fallen el pull hasta que `02-deploy-app` publique la primera imagen.
+  de AWS CLI listo para conseguir esa IP.
+- La task definition apunta a `cat-app:latest` en ECR desde el momento en
+  que se crea el servicio, antes de que `null_resource.build_and_push` haya
+  publicado la imagen — la primera task falla el pull (es esperado, y pasa
+  en segundos), y `null_resource.deploy` la reemplaza con un
+  `force-new-deployment` una vez que la imagen ya existe. Todo dentro del
+  mismo `apply`.
 - Fargate no tiene un host al que hacerle SSH, así que en vez de eso el
   servicio tiene **ECS Exec** habilitado (`enable_execute_command = true`
   + un task role con permisos de `ssmmessages:*`): shell interactivo dentro

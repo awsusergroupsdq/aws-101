@@ -57,8 +57,10 @@ jobs:
         if: inputs.action == 'apply'
         run: |
           {
-            echo "### Provisión Fargate completa"
-            echo "Cluster \`cat-cluster\` / servicio \`cat-service\` creados."
-            echo "Las tasks van a fallar el pull hasta el primer deploy — es esperado."
-            echo "Corré ahora **02-deploy-app** (target: fargate) para construir y publicar la imagen."
+            echo "### Fargate provisionado y app desplegada"
+            echo "El apply ya buildeó, publicó y desplegó \`cat-app\` — no hace falta ningún paso más."
+            echo ""
+            echo "\`\`\`"
+            tofu output
+            echo "\`\`\`"
           } >> "$GITHUB_STEP_SUMMARY"

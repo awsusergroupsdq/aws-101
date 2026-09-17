@@ -57,7 +57,10 @@ jobs:
         if: inputs.action == 'apply'
         run: |
           {
-            echo "### Provisión EC2 completa"
-            echo "Instancia esperada con tag \`Name=cat-webserver\`."
-            echo "Corré ahora **02-deploy-app** (target: ec2) para construir y publicar la imagen."
+            echo "### EC2 provisionado y app desplegada"
+            echo "El apply ya buildeó, publicó y desplegó \`cat-app\` — no hace falta ningún paso más."
+            echo ""
+            echo "\`\`\`"
+            tofu output
+            echo "\`\`\`"
           } >> "$GITHUB_STEP_SUMMARY"
