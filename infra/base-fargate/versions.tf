@@ -10,6 +10,10 @@ terraform {
       source  = "hashicorp/null"
       version = "~> 3.0"
     }
+    external = {
+      source  = "hashicorp/external"
+      version = "~> 2.0"
+    }
   }
 
   # Sin backend remoto a propósito: el state es local/efímero.

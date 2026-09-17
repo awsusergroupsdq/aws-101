@@ -1,6 +1,7 @@
-# Outputs informativos para quien corre `tofu apply` a mano.
-# El workflow de deploy NO depende de estos outputs: busca el cluster/servicio
-# por nombre con AWS CLI, porque el state no persiste entre runs de GitHub
+# Outputs para quien corre `tofu apply` — el build+push+deploy también vive
+# en este mismo stack (null_resource al final de main.tf), pero el destroy
+# (03-destroy.yml) sigue buscando los recursos por nombre con AWS CLI, no
+# por estos outputs, porque el state no persiste entre runs de GitHub
 # Actions. Ver infra/README.md.
 
 output "ecs_cluster_name" {
@@ -18,11 +19,16 @@ output "ecr_repository_url" {
   value       = aws_ecr_repository.cat_app.repository_url
 }
 
-# --- La IP pública de la task no existe hasta que 02-deploy-app la despliegue,
-#     así que no se puede dar como valor fijo — se da el comando para conseguirla. ---
+output "app_url" {
+  description = "Abrí esto en el navegador — la app ya está corriendo después del apply."
+  value       = "http://${data.external.task_ip.result.ip}"
+}
 
+# Sin ALB, esta IP cambia si la task se recrea (redeploy, o si ECS la
+# reinicia sola). Si sospechás que quedó vieja sin haber corrido un apply
+# nuevo, este comando te la trae fresca sin tocar el resto del state.
 output "find_ip_command" {
-  description = "Corré esto después de 02-deploy-app para conseguir la IP pública de la app."
+  description = "Para refrescar la IP a mano, sin re-aplicar. Normalmente no hace falta: usá app_url."
   value       = "aws ecs describe-tasks --cluster ${aws_ecs_cluster.cat_cluster.name} --tasks $(aws ecs list-tasks --cluster ${aws_ecs_cluster.cat_cluster.name} --service-name ${aws_ecs_service.cat_service.name} --query 'taskArns[0]' --output text) --query 'tasks[0].attachments[0].details[?name==`networkInterfaceId`].value' --output text | xargs -I{} aws ec2 describe-network-interfaces --network-interface-ids {} --query 'NetworkInterfaces[0].Association.PublicIp' --output text"
 }
 

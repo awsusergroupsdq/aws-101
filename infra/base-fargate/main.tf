@@ -217,3 +217,31 @@ resource "null_resource" "deploy" {
 
   depends_on = [null_resource.build_and_push, aws_ecs_service.cat_service]
 }
+
+# --- IP pública de la task, resuelta DESPUÉS del deploy (depends_on obliga a
+#     OpenTofu a leer esto recién en el apply, no en el plan) — así sale como
+#     output normal, sin tener que correr ningún comando aparte. Sin ALB, esta
+#     IP cambia cada vez que la task se recrea (redeploy, o si ECS la reinicia
+#     sola); volvé a correr `tofu apply` o `tofu apply -replace` de este data
+#     source para refrescarla si hace falta. ---
+
+data "external" "task_ip" {
+  program = ["bash", "-c", <<-EOT
+    set -euo pipefail
+    TASK_ARN=$(aws ecs list-tasks \
+      --cluster ${aws_ecs_cluster.cat_cluster.name} \
+      --service-name ${aws_ecs_service.cat_service.name} \
+      --region ${var.aws_region} --query 'taskArns[0]' --output text)
+    ENI_ID=$(aws ecs describe-tasks \
+      --cluster ${aws_ecs_cluster.cat_cluster.name} --tasks "$TASK_ARN" \
+      --region ${var.aws_region} \
+      --query 'tasks[0].attachments[0].details[?name==`networkInterfaceId`].value' --output text)
+    IP=$(aws ec2 describe-network-interfaces --network-interface-ids "$ENI_ID" \
+      --region ${var.aws_region} \
+      --query 'NetworkInterfaces[0].Association.PublicIp' --output text)
+    printf '{"ip":"%s"}' "$IP"
+  EOT
+  ]
+
+  depends_on = [null_resource.deploy]
+}
